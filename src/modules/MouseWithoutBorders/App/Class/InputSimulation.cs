@@ -10,6 +10,7 @@
 //     2009-... modified by Truong Do (TruongDo).
 //     2023- Included in PowerToys.
 // </history>
+using System;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Runtime.InteropServices;
@@ -31,6 +32,8 @@ namespace MouseWithoutBorders.Class
     {
         public static InputInjector Injector;
 
+        private static bool injectorRefused;
+
         private InputSimulation()
         {
         }
@@ -48,11 +51,39 @@ namespace MouseWithoutBorders.Class
             return injectedInput;
         }
 
+        // Sends one input event: a mouse move through the input injector when it is available, anything else through
+        // SendInput. The injector refuses a move now and then (#43292), and its exception used to end the connection, so
+        // a refused move goes through SendInput instead.
+        internal static uint InjectOrSendInput(bool useInjector, Action inject, Func<uint> sendInput)
+        {
+            if (useInjector)
+            {
+                try
+                {
+                    inject();
+                    injectorRefused = false;
+                    return 0;
+                }
+                catch (Exception e)
+                {
+                    // The mouse moves many times a second, so only the first refusal in a row is logged.
+                    if (!injectorRefused)
+                    {
+                        injectorRefused = true;
+                        Logger.Log($"{nameof(InjectOrSendInput)}: the input injector refused a mouse move, so it goes through SendInput: {e.GetType().Name}: {e.Message}");
+                    }
+                }
+            }
+
+            return sendInput();
+        }
+
         private static uint SendInputEx(NativeMethods.INPUT input)
         {
             Common.PaintCount = 0;
 
-            uint rv = 0;
+            bool useInjector = input.type == 0 && (input.mi.dwFlags & (int)NativeMethods.MOUSEEVENTF.MOVE) != 0 && NativeMethods.InjectMouseInputAvailable;
+
             if (Common.Is64bitOS)
             {
                 NativeMethods.INPUT64 input64 = default;
@@ -79,30 +110,16 @@ namespace MouseWithoutBorders.Class
                     input64.mi.dwExtraInfo = input.mi.dwExtraInfo;
                 }
 
-                if (input.type == 0 && (input.mi.dwFlags & (int)NativeMethods.MOUSEEVENTF.MOVE) != 0 && NativeMethods.InjectMouseInputAvailable)
-                {
-                    Injector.InjectMouseInput(new[] { MouseInputToInjectedInputMouseInfo(input64.mi) });
-                }
-                else
-                {
-                    NativeMethods.INPUT64[] inputs = { input64 };
-                    rv = NativeMethods.SendInput64(1, inputs, Marshal.SizeOf(input64));
-                }
-            }
-            else
-            {
-                if (input.type == 0 && (input.mi.dwFlags & (int)NativeMethods.MOUSEEVENTF.MOVE) != 0 && NativeMethods.InjectMouseInputAvailable)
-                {
-                    Injector.InjectMouseInput(new[] { MouseInputToInjectedInputMouseInfo(input.mi) });
-                }
-                else
-                {
-                    NativeMethods.INPUT[] inputs = { input };
-                    rv = NativeMethods.SendInput(1, inputs, Marshal.SizeOf(input));
-                }
+                return InjectOrSendInput(
+                    useInjector,
+                    () => Injector.InjectMouseInput(new[] { MouseInputToInjectedInputMouseInfo(input64.mi) }),
+                    () => NativeMethods.SendInput64(1, new[] { input64 }, Marshal.SizeOf(input64)));
             }
 
-            return rv;
+            return InjectOrSendInput(
+                useInjector,
+                () => Injector.InjectMouseInput(new[] { MouseInputToInjectedInputMouseInfo(input.mi) }),
+                () => NativeMethods.SendInput(1, new[] { input }, Marshal.SizeOf(input)));
         }
 
         internal static void SendKey(KEYBDDATA kd)
